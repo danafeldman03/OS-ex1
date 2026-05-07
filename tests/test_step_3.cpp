@@ -1,4 +1,5 @@
 #include "uthreads.h"
+#include "uthreads.cpp"
 #include <iostream>
 #include <cassert>
 

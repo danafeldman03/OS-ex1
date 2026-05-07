@@ -1,6 +1,8 @@
 #include <iostream>
 #include <cassert>
 #include "uthreads.h"
+#include "uthreads.cpp"
+
 
 using namespace std;
 

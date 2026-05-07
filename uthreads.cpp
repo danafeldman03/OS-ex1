@@ -209,6 +209,20 @@ int delete_thread(int tid){
 }
 
 int context_switch(){
+    for (Thread* t : threads) {
+        if (t && t->sleep_remaining > 0) {
+            t->sleep_remaining--;
+
+            if (t->sleep_remaining == 0) {
+                // becomes ready if not manually blocked
+                if (!t->is_manually_blocked) {
+                    t->state = READY;
+                    ready_queue.push_back(t->tid);
+                    t->ready_it = std::prev(ready_queue.end());
+                }
+            }
+        }
+    }
     int prev_tid = current_tid;
     Thread* prev = threads[prev_tid];
     if (sigsetjmp(prev->env, 1) == 0) {
@@ -308,6 +322,7 @@ int uthread_block(int tid) {
     if (thread->state == READY){
         ready_queue.erase(thread->ready_it);
     }
+    thread->is_manually_blocked = true;
     thread->state = BLOCKED;
     if (tid == current_tid){
         context_switch();
@@ -335,7 +350,8 @@ int uthread_resume(int tid) {
         std::cerr << "thread " << tid << " dose not exist" << std::endl;
         return -1;
     }
-    if (thread->sleep_remaining == 0){
+    thread->is_manually_blocked = false;
+    if (thread->sleep_remaining == 0 && thread->state==BLOCKED){
         ready_queue.push_back(tid);
         thread->ready_it = std::prev(ready_queue.end());
         thread->state = READY;
@@ -361,13 +377,20 @@ int uthread_resume(int tid) {
 */
 int uthread_sleep(int num_quantums) {
     // just for now
+    /*
     if (num_quantums != 0){
         std::cerr << "thread library error: " << "num_quantums should be 0" << std::endl;
         return -1;
     }
+    */
     if (current_tid==0 && num_quantums!=0){
         std::cerr << "thread library error: " << "cannot put main thread to sleep" << std::endl;
         return -1;
+    }
+    Thread* t = threads[current_tid];
+    if(num_quantums!=0){
+        t->sleep_remaining = num_quantums;
+        t->state = BLOCKED;
     }
     context_switch();
     return 0;

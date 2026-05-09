@@ -94,6 +94,9 @@ static std::vector<Thread*> threads(MAX_THREAD_NUM, nullptr);
 static std::list<int> ready_queue;
 static IDManager id_manager;
 static int thread_to_delete = -1;
+//timer implimentation
+static struct sigaction sa = {0};
+static struct itimerval timer;
 
 /**
  * @brief initializes the thread library.
@@ -209,20 +212,7 @@ int delete_thread(int tid){
 }
 
 int context_switch(){
-    for (Thread* t : threads) {
-        if (t && t->sleep_remaining > 0) {
-            t->sleep_remaining--;
-
-            if (t->sleep_remaining == 0) {
-                // becomes ready if not manually blocked
-                if (!t->is_manually_blocked) {
-                    t->state = READY;
-                    ready_queue.push_back(t->tid);
-                    t->ready_it = std::prev(ready_queue.end());
-                }
-            }
-        }
-    }
+    //scheduler + 
     int prev_tid = current_tid;
     Thread* prev = threads[prev_tid];
     if (sigsetjmp(prev->env, 1) == 0) {
@@ -241,6 +231,19 @@ int context_switch(){
         current_tid = next_tid;
         next->quantums++;
         total_quantums++;
+        for (Thread* t : threads) {
+            if (t && t->sleep_remaining > 0) {
+                t->sleep_remaining--;
+                if (t->sleep_remaining == 0) {
+                    // becomes ready if not manually blocked
+                    if (!t->is_manually_blocked) {
+                        t->state = READY;
+                        ready_queue.push_back(t->tid);
+                        t->ready_it = std::prev(ready_queue.end());
+                    }
+                }
+            }
+        }
         siglongjmp(next->env, 1);
     }
     if (thread_to_delete != -1) {

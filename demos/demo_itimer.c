@@ -4,9 +4,6 @@
  * Author: OS, os@cs.huji.ac.il
  */
 
-#include <stdio.h>
-#include <signal.h>
-#include <sys/time.h>
 
 
 int gotit = 0;

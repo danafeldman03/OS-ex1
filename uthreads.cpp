@@ -5,6 +5,9 @@
 #include <vector>
 #include <setjmp.h>
 #include <csignal>
+#include <stdio.h>
+#include <signal.h>
+#include <sys/time.h>
 
 //  מוסכמות 
 //  if there is no thread of id tid so threads[tid] = nullptr 
@@ -50,6 +53,7 @@ public:
     }
 
     int allocate() {
+        if (thread_cnt == MAX_THREAD_NUM) return -1;;
         for (int i = 1; i < MAX_THREAD_NUM; i++) {
             if (thread_cnt == MAX_THREAD_NUM){
                 return -1;
@@ -97,6 +101,154 @@ static int thread_to_delete = -1;
 //timer implimentation
 static struct sigaction sa = {0};
 static struct itimerval timer;
+static sigset_t signal_set;
+static int quantum_usecs_global = 0;
+
+void reset_timer()
+{
+    timer.it_value.tv_sec = quantum_usecs_global / 1000000;
+    timer.it_value.tv_usec = quantum_usecs_global % 1000000;
+
+    if (setitimer(ITIMER_VIRTUAL, &timer, NULL))
+    {
+        std::cerr << "system error: setitimer failed" << std::endl;
+        exit(1);
+    }
+}
+
+void block_signals()
+{
+    sigprocmask(SIG_BLOCK, &signal_set, NULL);
+}
+
+void unblock_signals()
+{
+    sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
+}
+
+void thread_start() {
+    Thread* t = threads[current_tid];
+    t->entry_point();
+    uthread_terminate(current_tid);
+    // should never reach here
+    while (true);
+}
+
+void setup_thread_context(Thread* thread){
+    address_t sp = (address_t) thread->stack + STACK_SIZE - sizeof(address_t);
+    address_t pc = (address_t) thread_start;
+    sigsetjmp(thread->env, 1);
+   (thread->env->__jmpbuf)[JB_SP] = translate_address(sp);
+    (thread->env->__jmpbuf)[JB_PC] = translate_address(pc);
+    sigemptyset(&thread->env->__saved_mask);
+}
+
+/**
+ * @brief Deleates the thread with ID tid and deletes it from all relevant control structures.
+ *
+ *
+ * @return The function returns 0 if the thread was successfully deleted and -1 otherwise. 
+*/
+int delete_thread(int tid){
+    if (tid >= MAX_THREAD_NUM || threads[tid] == nullptr){
+        std::cerr << "thread library error: " << "thread " << tid << " does not exist" << std::endl;
+        return -1;
+    }
+    Thread* thread = threads[tid];
+    if (!thread || thread->state == RUNNING) return -1;
+    if (thread->state == READY){
+        ready_queue.erase(thread->ready_it);
+    }
+    if (thread->stack != nullptr) {
+        delete[] thread->stack;
+        thread->stack = nullptr;
+    }
+    id_manager.release(tid);
+    threads[tid] = nullptr;
+    delete thread;
+    return 0;
+}
+
+void tag_sleepers(){
+    for (Thread* t : threads) {
+        if (t && t->sleep_remaining > 0) {
+            t->sleep_remaining--;
+            if (t->sleep_remaining == 0) {
+                // becomes ready if not manually blocked
+                if (!t->is_manually_blocked) {
+                    t->state = READY;
+                    ready_queue.push_back(t->tid);
+                    t->ready_it = std::prev(ready_queue.end());
+                }
+            }
+        }
+    }
+}
+
+int context_switch(bool count_quantum = true){
+    //block_signals();
+    int prev_tid = current_tid;
+    Thread* prev = threads[prev_tid];
+    if (sigsetjmp(prev->env, 1) == 0) {
+        if (prev->state == RUNNING) {
+            prev->state = READY;
+            ready_queue.push_back(prev_tid);
+            prev->ready_it = std::prev(ready_queue.end());
+        }
+        if (ready_queue.empty()) {
+            unblock_signals();
+            return -1; // nothing to run
+        }
+        int next_tid = ready_queue.front();
+        ready_queue.pop_front();
+        Thread* next = threads[next_tid];
+        next->state = RUNNING;
+        current_tid = next_tid;
+        next->quantums++;
+        total_quantums++;
+        if(count_quantum) tag_sleepers();
+        reset_timer();
+        unblock_signals();
+        siglongjmp(next->env, 1);
+    }
+    if (thread_to_delete != -1) {
+        int tid = thread_to_delete;
+        thread_to_delete = -1;
+        delete_thread(tid);
+    }
+
+    unblock_signals();
+    return 0;
+}
+
+void timer_handler(int sig)
+{
+    context_switch();
+}
+
+void setup_timer(int quantum_usecs){
+    sa.sa_handler = &timer_handler;
+    if (sigaction(SIGVTALRM, &sa, NULL) < 0)
+    {
+        std::cerr << "system error: sigaction setup failed" << std::endl;
+        exit(-1);
+    }
+
+    // Configure the timer to expire after quantum_usecs microsec... */
+    timer.it_value.tv_sec = quantum_usecs / 1000000;        // first time interval, seconds part
+    timer.it_value.tv_usec = quantum_usecs % 1000000;        // first time interval, microseconds part
+
+    // configure the timer to expire every quantum_usecs microsec after that.
+    timer.it_interval.tv_sec = 0;    // following time intervals, seconds part
+    timer.it_interval.tv_usec = 0;    // following time intervals, microseconds part
+
+    // Start a virtual timer. It counts down whenever this process is executing.
+    if (setitimer(ITIMER_VIRTUAL, &timer, NULL))
+    {
+        std::cerr << "system error: timer setup failed" << std::endl;
+        exit(-1);
+    }
+}
 
 /**
  * @brief initializes the thread library.
@@ -115,31 +267,16 @@ int uthread_init(int quantum_usecs) {
         std::cerr << "thread library error: invalid quantum" << std::endl;
         return -1;
     }
+    sigemptyset(&signal_set);
+    sigaddset(&signal_set, SIGVTALRM);
+    setup_timer(quantum_usecs);
     current_tid = 0;
     total_quantums = 1;
     Thread* main_thread = new Thread(current_tid, RUNNING, nullptr);
     main_thread->quantums = 1;
     threads[current_tid] = main_thread;
+    quantum_usecs_global = quantum_usecs;
     return 0;
-}
-
-
-void thread_start() {
-    Thread* t = threads[current_tid];
-    t->entry_point();
-    uthread_terminate(current_tid);
-    // should never reach here
-    while (true);
-}
-
-
-void setup_thread_context(Thread* thread){
-    address_t sp = (address_t) thread->stack + STACK_SIZE - sizeof(address_t);
-    address_t pc = (address_t) thread_start;
-    sigsetjmp(thread->env, 1);
-   (thread->env->__jmpbuf)[JB_SP] = translate_address(sp);
-    (thread->env->__jmpbuf)[JB_PC] = translate_address(pc);
-    sigemptyset(&thread->env->__saved_mask);
 }
 
 /**
@@ -155,13 +292,16 @@ void setup_thread_context(Thread* thread){
  * @return On success, return the ID of the created thread. On failure, return -1.
 */
 int uthread_spawn(thread_entry_point entry_point) {
+    block_signals();
     if (entry_point == nullptr){
         std::cerr << "thread library error: " << "entry point must be provided" << std::endl;
+        unblock_signals();
         return -1;   
     }
     int tid = id_manager.allocate();
     if (tid == -1) {
         std::cerr << "thread library error: max thread limit reached" << std::endl;
+        unblock_signals();
         return -1;
     }
     Thread* thread = new Thread(tid, READY, entry_point);
@@ -178,84 +318,13 @@ int uthread_spawn(thread_entry_point entry_point) {
     ready_queue.push_back(tid);
     thread->ready_it = std::prev(ready_queue.end());
     setup_thread_context(thread);
+    unblock_signals();
     return tid;
-}
-
-/**
- * @brief Deleates the thread with ID tid and deletes it from all relevant control structures.
- *
- *
- * @return The function returns 0 if the thread was successfully deleted and -1 otherwise. 
-*/
-int delete_thread(int tid){
-    if (tid > MAX_THREAD_NUM){
-        std::cerr << "thread " << tid << " dose not exist" << std::endl;
-        return -1;
-    }
-    Thread* thread = threads[tid];
-    if (thread == nullptr){
-        std::cerr << "thread " << tid << " dose not exist" << std::endl;
-        return -1;
-    }
-    if (!thread || thread->state == RUNNING) return -1;
-    if (thread->state == READY){
-        ready_queue.erase(thread->ready_it);
-    }
-    if (thread->stack != nullptr) {
-        delete[] thread->stack;
-        thread->stack = nullptr;
-    }
-    id_manager.release(tid);
-    threads[tid] = nullptr;
-    delete thread;
-    return 0;
-}
-
-int context_switch(){
-    //scheduler + 
-    int prev_tid = current_tid;
-    Thread* prev = threads[prev_tid];
-    if (sigsetjmp(prev->env, 1) == 0) {
-        if (prev->state == RUNNING) {
-            prev->state = READY;
-            ready_queue.push_back(prev_tid);
-            prev->ready_it = std::prev(ready_queue.end());
-        }
-        if (ready_queue.empty()) {
-            return -1; // nothing to run
-        }
-        int next_tid = ready_queue.front();
-        ready_queue.pop_front();
-        Thread* next = threads[next_tid];
-        next->state = RUNNING;
-        current_tid = next_tid;
-        next->quantums++;
-        total_quantums++;
-        for (Thread* t : threads) {
-            if (t && t->sleep_remaining > 0) {
-                t->sleep_remaining--;
-                if (t->sleep_remaining == 0) {
-                    // becomes ready if not manually blocked
-                    if (!t->is_manually_blocked) {
-                        t->state = READY;
-                        ready_queue.push_back(t->tid);
-                        t->ready_it = std::prev(ready_queue.end());
-                    }
-                }
-            }
-        }
-        siglongjmp(next->env, 1);
-    }
-    if (thread_to_delete != -1) {
-        int tid = thread_to_delete;
-        thread_to_delete = -1;
-        delete_thread(tid);
-    }
-    return 0;
 }
 
 void terminate_process(){
     for (Thread* t : threads){
+        if (t==nullptr) continue;
         if (t->stack != nullptr){
                 delete[] t->stack;
             }
@@ -277,8 +346,10 @@ void terminate_process(){
  * itself or the main thread is terminated, the function does not return.
 */
 int uthread_terminate(int tid){
-    if (threads[tid] == nullptr){
-        std::cerr << "thread " << tid << " dose not exist." << std::endl;
+    block_signals();
+    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr){
+        std::cerr << "thread library error: " << "thread " << tid << " does not exist" << std::endl;
+        unblock_signals();
         return -1;
     }
 // special case: main thread
@@ -286,13 +357,13 @@ int uthread_terminate(int tid){
         terminate_process();
     }
     if(tid == current_tid){
-        Thread* t = threads[tid];
-        t->state = BLOCKED;
+        threads[tid]->state = BLOCKED;
         thread_to_delete = current_tid;
         context_switch();
     }
     else{
         delete_thread(tid);
+        unblock_signals();
     }
     return 0;
 }
@@ -308,18 +379,23 @@ int uthread_terminate(int tid){
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_block(int tid) {
+    block_signals();
     if (tid == 0){
-        std::cerr << "cant block main thread." << std::endl;
+        std::cerr << "thread library error: " << "cant block main thread" << std::endl;
+        unblock_signals();
         return -1;
     }
-    if (tid > MAX_THREAD_NUM){
-        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+    if (tid >= MAX_THREAD_NUM || threads[tid] == nullptr){
+        std::cerr << "thread library error: " << "thread " << tid << " does not exist" << std::endl;
+        unblock_signals();
         return -1;
     }
     Thread* thread = threads[tid];
-    if (thread == nullptr){
-        std::cerr << "thread " << tid << " dose not exist" << std::endl;
-        return -1;
+    if (thread->state == BLOCKED)
+    {
+        thread->is_manually_blocked = true;
+        unblock_signals();
+        return 0;
     }
     // what if a thread blocks itself  ==== blocks the ruuning ? 
     if (thread->state == READY){
@@ -330,6 +406,7 @@ int uthread_block(int tid) {
     if (tid == current_tid){
         context_switch();
     }
+    unblock_signals();
     return 0;
 }
 
@@ -344,21 +421,20 @@ int uthread_block(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_resume(int tid) {
-    if (tid > MAX_THREAD_NUM){
-        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+    block_signals();
+    if (tid >= MAX_THREAD_NUM || threads[tid] == nullptr){
+        std::cerr << "thread library error: thread " << tid << " does not exist" << std::endl;
+        unblock_signals();
         return -1;
     }
     Thread* thread = threads[tid];
-    if (thread == nullptr){
-        std::cerr << "thread " << tid << " dose not exist" << std::endl;
-        return -1;
-    }
     thread->is_manually_blocked = false;
     if (thread->sleep_remaining == 0 && thread->state==BLOCKED){
         ready_queue.push_back(tid);
         thread->ready_it = std::prev(ready_queue.end());
         thread->state = READY;
     }
+    unblock_signals();
     return 0;
 }
 
@@ -386,16 +462,24 @@ int uthread_sleep(int num_quantums) {
         return -1;
     }
     */
+    block_signals();
+    if (num_quantums < 0)
+    {
+        std::cerr << "thread library error: " << "invalid sleep value" << std::endl;
+        unblock_signals();
+        return -1;
+    }
     if (current_tid==0 && num_quantums!=0){
         std::cerr << "thread library error: " << "cannot put main thread to sleep" << std::endl;
+        unblock_signals();
         return -1;
     }
     Thread* t = threads[current_tid];
-    if(num_quantums!=0){
+    if(num_quantums > 0){
         t->sleep_remaining = num_quantums;
         t->state = BLOCKED;
     }
-    context_switch();
+    context_switch(false);
     return 0;
 }
 
@@ -433,10 +517,9 @@ int uthread_get_total_quantums() {
  * @return On success, return the number of quantums of the thread with ID tid. On failure, return -1.
 */
 int uthread_get_quantums(int tid) {
-    Thread*  thread = threads[tid];
-    if (thread == nullptr) {
-            std::cerr << "thread does not exist\n";
-            return -1;
-        }
-    return thread->quantums;
+    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
+        std::cerr << "thread library error: thread does not exist\n";
+        return -1;
+    }
+    return threads[tid]->quantums;
 }

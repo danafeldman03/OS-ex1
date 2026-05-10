@@ -39,6 +39,12 @@ struct Thread {
           entry_point(entry){}
 };
 
+/**
+ * @brief Manages available thread IDs for the user-level thread library.
+ *
+ * IDs are allocated from 1 to MAX_THREAD_NUM-1. The main thread always uses tid == 0 and is
+ * handled separately by the library initialization logic.
+ */
 class IDManager {
 private:
     bool used[MAX_THREAD_NUM];
@@ -52,6 +58,11 @@ public:
         thread_cnt = 0;
     }
 
+    /**
+     * @brief Allocate an unused thread ID.
+     *
+     * @return The allocated thread ID on success, or -1 if the thread limit is reached.
+     */
     int allocate() {
         if (thread_cnt == MAX_THREAD_NUM) return -1;;
         for (int i = 1; i < MAX_THREAD_NUM; i++) {
@@ -67,6 +78,11 @@ public:
         return -1;
     }
 
+    /**
+     * @brief Release a previously allocated thread ID.
+     *
+     * @param tid The thread ID to release.
+     */
     void release(int tid) {
         if (tid >= 0 && tid < MAX_THREAD_NUM) {
             used[tid] = false;
@@ -104,6 +120,10 @@ static struct itimerval timer;
 static sigset_t signal_set;
 static int quantum_usecs_global = 0;
 
+/**
+ * @brief Reset the virtual timer for the next quantum interval.
+    * This function is called at the end of each context switch.
+ */
 void reset_timer()
 {
     timer.it_value.tv_sec = quantum_usecs_global / 1000000;
@@ -116,16 +136,27 @@ void reset_timer()
     }
 }
 
+/**
+ * @brief Block thread library timer signals.
+ *
+ * Used to protect internal library state from asynchronous SIGVTALRM delivery.
+ */
 void block_signals()
 {
     sigprocmask(SIG_BLOCK, &signal_set, NULL);
 }
 
+/**
+ * @brief Unblock thread library timer signals.
+ */
 void unblock_signals()
 {
     sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
 }
 
+/**
+ * @brief Entry wrapper for newly spawned threads.
+ */
 void thread_start() {
     Thread* t = threads[current_tid];
     t->entry_point();
@@ -134,6 +165,10 @@ void thread_start() {
     while (true);
 }
 
+/**
+ * @brief Initialize the saved CPU context for a new thread.
+ * @param thread The thread object whose context is initialized.
+ */
 void setup_thread_context(Thread* thread){
     address_t sp = (address_t) thread->stack + STACK_SIZE - sizeof(address_t);
     address_t pc = (address_t) thread_start;
@@ -144,11 +179,10 @@ void setup_thread_context(Thread* thread){
 }
 
 /**
- * @brief Deleates the thread with ID tid and deletes it from all relevant control structures.
- *
- *
- * @return The function returns 0 if the thread was successfully deleted and -1 otherwise. 
-*/
+ * @brief Remove a non-running thread from library state and free its resources.
+ * @param tid The thread ID to delete.
+ * @return 0 on success, -1 if the thread does not exist or is currently running.
+ */
 int delete_thread(int tid){
     if (tid >= MAX_THREAD_NUM || threads[tid] == nullptr){
         std::cerr << "thread library error: " << "thread " << tid << " does not exist" << std::endl;
@@ -169,7 +203,13 @@ int delete_thread(int tid){
     return 0;
 }
 
-void tag_sleepers(){
+/**
+ * @brief Decrement sleep counters for all sleeping threads.
+ *
+ * When a sleeping thread's remaining sleep time reaches zero, it is moved to the end of
+ * the ready queue unless it was manually blocked by uthread_block().
+ */
+void dec_sleepers_time(){
     for (Thread* t : threads) {
         if (t && t->sleep_remaining > 0) {
             t->sleep_remaining--;
@@ -185,6 +225,15 @@ void tag_sleepers(){
     }
 }
 
+/**
+ * @brief Switch execution from the current thread to the next ready thread.
+ *
+ * Saves the current thread context, updates thread states, wakes sleeping threads, and
+ * dispatches the next thread from the ready queue.
+ *
+ * @param count_quantum If true, the switch counts as a new quantum and decrements sleepers.
+ * @return 0 on success, -1 if there is no ready thread to run.
+ */
 int context_switch(bool count_quantum = true){
     //block_signals();
     int prev_tid = current_tid;
@@ -206,7 +255,7 @@ int context_switch(bool count_quantum = true){
         current_tid = next_tid;
         next->quantums++;
         total_quantums++;
-        if(count_quantum) tag_sleepers();
+        if(count_quantum) dec_sleepers_time();
         reset_timer();
         unblock_signals();
         siglongjmp(next->env, 1);
@@ -216,16 +265,22 @@ int context_switch(bool count_quantum = true){
         thread_to_delete = -1;
         delete_thread(tid);
     }
-
     unblock_signals();
     return 0;
 }
 
+/**
+ * @brief Signal handler for virtual timer expiration.
+ */
 void timer_handler(int sig)
 {
     context_switch();
 }
 
+/**
+ * @brief Configure the SIGVTALRM virtual timer used for preemption.
+ * @param quantum_usecs The length of each quantum in microseconds.
+ */
 void setup_timer(int quantum_usecs){
     sa.sa_handler = &timer_handler;
     if (sigaction(SIGVTALRM, &sa, NULL) < 0)
@@ -253,8 +308,9 @@ void setup_timer(int quantum_usecs){
 /**
  * @brief initializes the thread library.
  *
- * Once this function returns, the main thread (tid == 0) will be set as RUNNING. There is no need to 
- * provide an entry_point or to create a stack for the main thread - it will be using the "regular" stack and PC.
+ * Once this function returns, the main thread (tid == 0) will be set as RUNNING. There is no need to
+ * provide an entry_point or to create a stack for the main thread.
+ * It will be using the "regular" stack and PC.
  * You may assume that this function is called before any other thread library function, and that it is called
  * exactly once.
  * The input to the function is the length of a quantum in micro-seconds.
@@ -322,6 +378,11 @@ int uthread_spawn(thread_entry_point entry_point) {
     return tid;
 }
 
+/**
+ * @brief Clean up all thread library resources and terminate the process.
+ *
+ * This helper is called when the main thread is terminated.
+ */
 void terminate_process(){
     for (Thread* t : threads){
         if (t==nullptr) continue;
@@ -338,12 +399,13 @@ void terminate_process(){
 /**
  * @brief Terminates the thread with ID tid and deletes it from all relevant control structures.
  *
- * All the resources allocated by the library for this thread should be released. If no thread with ID tid exists it
- * is considered an error. Terminating the main thread (tid == 0) will result in the termination of the entire
- * process using exit(0) (after releasing the assigned library memory).
+ * All the resources allocated by the library for this thread should be released.
+ * If no thread with ID tid exists it is considered an error. Terminating the main thread
+ * (tid == 0) will result in the termination of the entire process using exit(0) (after
+ * releasing the assigned library memory).
  *
- * @return The function returns 0 if the thread was successfully terminated and -1 otherwise. If a thread terminates
- * itself or the main thread is terminated, the function does not return.
+ * @return The function returns 0 if the thread was successfully terminated and -1 otherwise.
+ * If a thread terminates itself or the main thread is terminated, the function does not return.
 */
 int uthread_terminate(int tid){
     block_signals();
@@ -372,9 +434,10 @@ int uthread_terminate(int tid){
 /**
  * @brief Blocks the thread with ID tid. The thread may be resumed later using uthread_resume.
  *
- * If no thread with ID tid exists it is considered as an error. In addition, it is an error to try blocking the
- * main thread (tid == 0). If a thread blocks itself, a scheduling decision should be made. Blocking a thread in
- * BLOCKED state has no effect and is *not* considered an error.
+ * If no thread with ID tid exists it is considered as an error.
+ * In addition, it is an error to try blocking the main thread (tid == 0).
+ * If a thread blocks itself, a scheduling decision should be made.
+ * Blocking a thread in BLOCKED state has no effect and is *not* considered an error.
  *
  * @return On success, return 0. On failure, return -1.
 */
@@ -414,9 +477,9 @@ int uthread_block(int tid) {
 /**
  * @brief Resumes a blocked thread with ID tid and moves it to the READY state.
  *
- * Resuming a thread in a RUNNING or READY state has no effect and is not considered as an error. If no thread with
- * ID tid exists it is considered an error.
- * When a thread transition to the READY state it is placed at the end of the READY queue.
+ * Resuming a thread in a RUNNING or READY state has no effect and is not considered an error.
+ * If no thread with ID tid exists it is considered an error.
+ * When a thread transitions to the READY state it is placed at the end of the READY queue.
  *
  * @return On success, return 0. On failure, return -1.
 */
@@ -444,12 +507,15 @@ int uthread_resume(int tid) {
  *
  * Immediately after the RUNNING thread transitions to the BLOCKED state a scheduling decision should be made.
  * After the sleeping time is over, the thread should go back to the end of the READY queue.
- * If the thread which was just RUNNING should also be added to the READY queue, or if multiple threads wake up 
- * at the same time, the order in which they're added to the end of the READY queue doesn't matter.
- * The number of quantums refers to the number of times a new quantum starts, regardless of the reason. Specifically,
- * the quantum of the thread which has made the call to uthread_sleep isn’t counted.
- * A call with num_quantums == 0 will immediately stop the thread and move it to the back of the execution queue.
- * 
+ * If the thread which was just RUNNING should also be added to the READY queue,
+ * or if multiple threads wake up at the same time, the order in which they are added
+ * to the end of the READY queue does not matter.
+ * The number of quantums refers to the number of times a new quantum starts,
+ * regardless of the reason.
+ * Specifically, the quantum of the thread that made the call to uthread_sleep isn’t counted.
+ * A call with num_quantums == 0 will immediately stop the thread and move it to
+ * the back of the execution queue.
+ *
  * It is considered an error if the main thread (tid == 0) calls this function with num_quantums != 0.
  *
  * @return On success, return 0. On failure, return -1.
@@ -495,7 +561,8 @@ int uthread_get_tid() {
 
 
 /**
- * @brief Returns the total number of quantums since the library was initialized, including the current quantum.
+ * @brief Returns the total number of quantums since the library was initialized,
+ * including the current quantum.
  *
  * Right after the call to uthread_init, the value should be 1.
  * Each time a new quantum starts, regardless of the reason, this number should be increased by 1.
@@ -510,9 +577,10 @@ int uthread_get_total_quantums() {
 /**
  * @brief Returns the number of quantums the thread with ID tid was in RUNNING state.
  *
- * On the first time a thread runs, the function should return 1. Every additional quantum that the thread starts should
- * increase this value by 1 (so if the thread with ID tid is in RUNNING state when this function is called, include
- * also the current quantum). If no thread with ID tid exists it is considered an error.
+ * On the first time a thread runs, the function should return 1.
+ * Every additional quantum that the thread starts should increase this value by 1.
+ * If the thread with ID tid is in RUNNING state when this function is called, include
+ * the current quantum. If no thread with ID tid exists it is considered an error.
  *
  * @return On success, return the number of quantums of the thread with ID tid. On failure, return -1.
 */
